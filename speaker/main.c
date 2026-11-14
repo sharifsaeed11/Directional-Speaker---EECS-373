@@ -40,128 +40,202 @@
 #include "cybsp.h"
 #include "cy_utils.h"
 
+
 #include <stdalign.h>
+#include <math.h>
 
 #include "audio.h"
-#include "test.h"
 
 #define XMC4700_SPEED_HZ 144000000
+#define SIGNAL_FREQUENCY 40000
 
-#define EDGE_ALIGNED_TIMER_PERIOD 3600
-#define CENTER_ALIGNED_TIMER_PERIOD 1800
+#define EDGE_ALIGNED_TIMER_PERIOD (XMC4700_SPEED_HZ / SIGNAL_FREQUENCY)
+#define CENTER_ALIGNED_TIMER_PERIOD (XMC4700_SPEED_HZ / SIGNAL_FREQUENCY) / 2
 
 #define NUM_SAMPLES 256
+#define BITS_PER_SAMPLE 16
+#define BYTES_PER_SAMPLE BITS_PER_SAMPLE / 8 // 8 bits per byte
+#define TOTAL_SAMPLES_BYTES NUM_SAMPLES * BYTES_PER_SAMPLE
+
 #define NUM_SPEAKERS 1 // Number of potentional elements in the array
+
+// alignas(4) makes sure arrays are word aligned
 
 // Audio file has 62694 16-bit values (represented by 125388 8-bit values where audio[0]=MSB and audio[1]=LSB of a 16 bit value)
 // It should sound like a piano key (this is just a temporary setup)
 // The audio file is stored in the "audio.h" file in the "piano_note_bin" array
 
-uint32_t num_samples = 62694;
-uint32_t sample_index = 0;
-
-// DMA from peripheral to memory (audio from somewhere else)
 // this is the buffer for audio before being converted into compare registers
-// these will be handled in an ISR
-alignas(4) uint16_t dma_buffer_ping[NUM_SAMPLES];
-alignas(4) uint16_t dma_buffer_pong[NUM_SAMPLES];
+// these will be handled in an ISR (switching which buffer is being filled)
 
-// This will have DMA sending values in these buffers to compare registers in CCU8 timers
-// alignas(4) makes sure arrays are word aligned
-alignas(4) uint32_t audio_ping[NUM_SPEAKERS][NUM_SAMPLES]; // audio_buffer_0 (most sig. 16 bits is CR1, least sig. 16 bits is CR2)
-alignas(4) uint32_t audio_pong[NUM_SPEAKERS][NUM_SAMPLES]; // audio_buffer_1 (most sig. 16 bits is CR1, least sig. 16 bits is CR2)
+// Source audio values are signed integers
+alignas(4) int16_t source_audio_buffer[2][NUM_SAMPLES];
+uint32_t src_audio_size = 0;
+uint32_t src_audio_index = 0;
 
+// This will have the processed compare register values that will be written to timers by DMA channel
+// The compare register values are unsigned integers (after converting the signed source audio values)
+alignas(4) uint32_t audio_buffer[2][NUM_SAMPLES];
+uint32_t shadow_transfer_enable = CCU4_GCSS_S0SE_Msk;
 
-#define speaker0_dma_ch 0
-#define speaker1_dma_ch 1
-#define speaker2_dma_ch 2
-#define speaker3_dma_ch 3
-#define speaker4_dma_ch 4
-#define speaker5_dma_ch 5
-#define speaker6_dma_ch 6
-#define speaker7_dma_ch 7
+uint32_t buffer_to_load = 0;
 
+bool loop = false;
 
+// These are aliases for source and destination addresses that the XMC configurator will use for the DMA channel
+uint32_t *shadow_transfer_src_ptr = &shadow_transfer_enable;
+uint32_t *shadow_transfer_dst_ptr = (uint32_t *)&(CCU40->GCSS);
 
-//Audio buffer split into two halves
-alignas(4) static uint16_t audio_buffer[2][NUM_SPEAKERS][NUM_SAMPLES * 2];
-int buffer_index = 0;
-// int audio_done = 0;
-
-// Two instruction cards telling DAC DMA which buffer to play.
-static XMC_DMA_LLI_t blocks[NUM_SPEAKERS][2]; // 2 buffers for each speaker output
-
-
-void build_instruction_cards(void){
-
-  //build 2 instruction cards
-  for (unsigned speaker = 0; speaker < NUM_SPEAKERS; speaker++) {
-    for (unsigned i = 0; i < 2; ++i){
-
-        // First sample for each block
-        blocks[speaker][i].src_addr = (uint32_t)&audio_buffer[i][speaker];
-        // Create a linked list of all the blocks
-        blocks[speaker][i].llp = (i < 1) ? &blocks[speaker][i + 1] : &blocks[speaker][0];
-        
-        // Transfer settings from Device Configurator
-        if (speaker == 0)      blocks[speaker][i].control = gpdma_0_ch_0_config.control;
-        else if (speaker == 1) blocks[speaker][i].control = gpdma_0_ch_1_config.control;
-        else if (speaker == 2) blocks[speaker][i].control = gpdma_0_ch_2_config.control;
-        else if (speaker == 3) blocks[speaker][i].control = gpdma_0_ch_3_config.control;
-        else if (speaker == 4) blocks[speaker][i].control = gpdma_0_ch_4_config.control;
-        else if (speaker == 5) blocks[speaker][i].control = gpdma_0_ch_5_config.control;
-        else if (speaker == 6) blocks[speaker][i].control = gpdma_0_ch_6_config.control;
-        else if (speaker == 7) blocks[speaker][i].control = gpdma_0_ch_7_config.control;
-
-        blocks[speaker][i].block_size = 256;
-
-        // The two block should link to each other
-        blocks[speaker][i].enable_src_linked_list = 1;
-        
-    }
-
+__attribute__((aligned(32))) XMC_DMA_LLI_t dma_ll[2] =
+{
+  {
+    .block_size = NUM_SAMPLES,                                            /* Transfer Block size */
+    .src_addr = (uint32_t)&audio_buffer[0][0],                            /* Source address */
+    .dst_addr = (uint32_t)&CCU40_CC40->CRS,                                /* Destination address */
+    .llp = &dma_ll[1],                                                   /* Linked list pointer of type XMC_DMA_LLI_t */
+    .src_transfer_width = XMC_DMA_CH_TRANSFER_WIDTH_32,                  /* Source transfer width */
+    .dst_transfer_width = XMC_DMA_CH_TRANSFER_WIDTH_32,                  /* Destination transfer width */
+    .src_address_count_mode = XMC_DMA_CH_ADDRESS_COUNT_MODE_INCREMENT,   /* Source address count mode */
+    .dst_address_count_mode = XMC_DMA_CH_ADDRESS_COUNT_MODE_NO_CHANGE,   /* Destination address count mode */
+    .dst_burst_length = XMC_DMA_CH_BURST_LENGTH_1,                       /* Destination burst length */
+    .src_burst_length = XMC_DMA_CH_BURST_LENGTH_1,                       /* Source burst length */
+    .transfer_flow = XMC_DMA_CH_TRANSFER_FLOW_M2P_DMA,                   /* DMA Transfer flow */
+    .enable_src_linked_list = true,                                      /* Enable source linked list? */
+    .enable_dst_linked_list = true,                                      /* Enable destination linked list? */
+    .enable_interrupt = true,
+  },
+  {
+    .block_size = NUM_SAMPLES,                                            /* Transfer Block size */
+    .src_addr = (uint32_t)&audio_buffer[1][0],                            /* Source address */
+    .dst_addr = (uint32_t)&CCU40_CC40->CRS,                                /* Destination address */
+    .llp = &dma_ll[0],                                                   /* Linked list pointer of type XMC_DMA_LLI_t */
+    .src_transfer_width = XMC_DMA_CH_TRANSFER_WIDTH_32,                  /* Source transfer width */
+    .dst_transfer_width = XMC_DMA_CH_TRANSFER_WIDTH_32,                  /* Destination transfer width */
+    .src_address_count_mode = XMC_DMA_CH_ADDRESS_COUNT_MODE_INCREMENT,   /* Source address count mode */
+    .dst_address_count_mode = XMC_DMA_CH_ADDRESS_COUNT_MODE_NO_CHANGE,   /* Destination address count mode */
+    .src_burst_length = XMC_DMA_CH_BURST_LENGTH_1,                       /* Source burst length */
+    .dst_burst_length = XMC_DMA_CH_BURST_LENGTH_1,                       /* Destination burst length */
+    .transfer_flow = XMC_DMA_CH_TRANSFER_FLOW_M2P_DMA,                   /* DMA Transfer flow */
+    .enable_src_linked_list = true,                                      /* Enable source linked list? */
+    .enable_dst_linked_list = true,                                      /* Enable destination linked list? */
+    .enable_interrupt = true,  
   }
+};
 
-  // Point DMA at the first instruction card.
-  XMC_DMA_CH_SetLinkedListPointer(XMC_DMA0, speaker0_dma_ch, blocks); // just one channel for now
-//   XMC_DMA_CH_SetLinkedListPointer(XMC_DMA0, speaker1_dma_ch, blocks);
-//   XMC_DMA_CH_SetLinkedListPointer(XMC_DMA0, speaker2_dma_ch, blocks);
-//   XMC_DMA_CH_SetLinkedListPointer(XMC_DMA0, speaker3_dma_ch, blocks);
-//   XMC_DMA_CH_SetLinkedListPointer(XMC_DMA0, speaker4_dma_ch, blocks);
-//   XMC_DMA_CH_SetLinkedListPointer(XMC_DMA0, speaker5_dma_ch, blocks);
-//   XMC_DMA_CH_SetLinkedListPointer(XMC_DMA0, speaker6_dma_ch, blocks);
-//   XMC_DMA_CH_SetLinkedListPointer(XMC_DMA0, speaker7_dma_ch, blocks);
+XMC_DMA_LLI_t *LLP_for_timer = &dma_ll[0]; // This basicaly does XMC_DMA_CH_SetLinkedListPointer(XMC_DMA#, dma channel, first instruction card);
 
+
+// inline uint16_t pcm_to_edge_aligned_compare_val(uint32_t pcm_val){ // This one is not being used
+
+//     uint32_t result = (((pcm_val + 32768U) * EDGE_ALIGNED_TIMER_PERIOD) >> 16);
+
+//     return EDGE_ALIGNED_TIMER_PERIOD - result;
+
+// }
+
+void reset_audio_buffer(uint32_t buffer_index){
+    for (int i = 0; i < NUM_SAMPLES; i++) audio_buffer[buffer_index][i] = (CENTER_ALIGNED_TIMER_PERIOD / 2); // 50% duty cycle
 }
 
-
-
-
-// CCU80 offset 40020000
-// CCU80_SLICE0_CR1S = 0x4002023C (0x40020100 + 0x013C = 0x4002023C)
-#define CCU80_SLICE0_CR1S CCU80_CC80_BASE + 0x013C
-
-
-
-
-inline uint32_t pcm_to_center_aligned_compare_val(uint32_t pcm_val){
-
-    uint32_t result = (pcm_val * CENTER_ALIGNED_TIMER_PERIOD) >> 16;
+inline uint16_t signed_pcm_to_compare_val(int16_t pcm_val){ // This is a fast way to do the conversion
+    
+    // Converts the signed integer into unsigned (while still preserving its relative value),
+    // then multiplies by timer period (so that we have a value that is a mutiple of the timer period),
+    // then that value is divided by 2^16 (65536)
+    uint32_t result = (uint32_t) (((pcm_val + 32768U) * CENTER_ALIGNED_TIMER_PERIOD) >> 16);
 
     return CENTER_ALIGNED_TIMER_PERIOD - result;
 
 }
 
-inline uint32_t pcm_to_edge_aligned_compare_val(uint32_t pcm_val){
+void fill_buffer(uint32_t buffer_index){
 
-    uint32_t result = (pcm_val * EDGE_ALIGNED_TIMER_PERIOD) >> 16;
+    for (int i = 0; i < NUM_SAMPLES; i++) {
+        
+        if (src_audio_index < src_audio_size){
 
-    return EDGE_ALIGNED_TIMER_PERIOD - result;
+            // This should be temporary
+            int16_t val = source_audio_buffer[buffer_index][i];
+            val = ((val & 0xff00) >> 8) | ((val & 0x00ff) << 8);
+            
+            val = 1.0f * val; // This is just to adjust the volume if the audio is too quiet
+            audio_buffer[buffer_index][i] = signed_pcm_to_compare_val(val);
+            src_audio_index++;
+        }
+        else audio_buffer[buffer_index][i] = (CENTER_ALIGNED_TIMER_PERIOD / 2); // This results in compare value of 900 (50% duty cycle)
+    }
 
 }
 
+#define DMA_CH0_HW XMC_DMA0
+#define DMA_CH1_HW XMC_DMA0
+#define DMA_CH2_HW XMC_DMA0
+#define CCU4_DMA_CH0 0
+#define SHADOW_TRANSFER_DMA_CH1 1
+#define SOURCE_DMA_CH2 2
 
-// length 125388, 62694 samples
+
+void dma_load_source_audio(XMC_DMA_t* dma_group, uint8_t dma_channel, uint32_t src_addr, uint32_t dst_addr){
+
+    XMC_DMA_CH_SetDestinationAddress(dma_group, dma_channel, dst_addr);
+    XMC_DMA_CH_SetSourceAddress(dma_group, dma_channel, src_addr);
+    XMC_DMA_CH_Enable(dma_group, dma_channel);
+
+    buffer_to_load = !buffer_to_load;
+
+}
+
+// Device Configurator registers this callback for DAC DMA.
+void gpdma_0_ch_0_EventHandler(XMC_DMA_CH_EVENT_t event){
+    
+    if (event != XMC_DMA_CH_EVENT_BLOCK_TRANSFER_COMPLETE) return;
+
+    if (src_audio_index < src_audio_size) {
+
+        while (XMC_DMA_CH_IsEnabled(DMA_CH2_HW, SOURCE_DMA_CH2)){} // Just to make sure DMA is finished
+        
+        // Set the DMA to get the next chunk of audio values from source
+        dma_load_source_audio(DMA_CH2_HW, SOURCE_DMA_CH2, (uint32_t)(piano_note_bin + ((src_audio_index + 256) * 2)), (uint32_t) source_audio_buffer[buffer_to_load]);
+
+        // Process source buffer into audio buffer
+        fill_buffer(buffer_to_load);
+
+    }
+    else if (loop) {
+    
+        src_audio_index = 0;
+
+        dma_load_source_audio(DMA_CH2_HW, SOURCE_DMA_CH2, (uint32_t)(piano_note_bin), (uint32_t) source_audio_buffer[buffer_to_load]);
+
+        fill_buffer(buffer_to_load);
+
+    }
+    else { // Stop Output
+
+        // // These two lines are just for good measure
+        // NVIC_DisableIRQ(GPDMA0_0_IRQn); 
+        // XMC_DMA_CH_DisableEvent(DMA_CH0_HW, CCU4_DMA_CH0, XMC_DMA_CH_EVENT_BLOCK_TRANSFER_COMPLETE);
+
+        // XMC_DMA_CH_Disable(DMA_CH0_HW, CCU4_DMA_CH0);            // Enable the DMA for timer compare registers
+        // XMC_DMA_CH_Disable(DMA_CH1_HW, SHADOW_TRANSFER_DMA_CH1); // Enable the DMA for the shadow transfer enable
+        // XMC_CCU4_SLICE_StopTimer(CCU40_CC40); // Stop the PWM
+        reset_audio_buffer(buffer_to_load);
+        buffer_to_load = !buffer_to_load;
+
+
+    }
+
+
+    return;
+
+}
+
+// Pass DMA interrupts to the library, which calls our callback.
+void GPDMA0_0_IRQHandler(void){
+   XMC_DMA_IRQHandler(XMC_DMA0);
+}
+
+
 int main(void)
 {
     cy_rslt_t result;
@@ -173,44 +247,163 @@ int main(void)
         CY_ASSERT(0);
     }
 
+    loop = true;
+
+    buffer_to_load = 0;
+
+    src_audio_index = 0;
+    src_audio_size = piano_note_bin_len / 2; // piano_note_bin_len size in bytes / 2 bytes per 16 bit val
+    
+    reset_audio_buffer(0);
+    reset_audio_buffer(1);
+
+    dma_load_source_audio(DMA_CH2_HW, SOURCE_DMA_CH2, (uint32_t) piano_note_bin, (uint32_t)source_audio_buffer[buffer_to_load]); // DMA fills source_audio_buffer[0]
+
+    // Enable the DMA channel to initiate transfer + Start the timer for the PWM
     NVIC_EnableIRQ(GPDMA0_0_IRQn); // one channel for now
-    // NVIC_EnableIRQ(GPDMA0_1_IRQn);
-    // NVIC_EnableIRQ(GPDMA0_2_IRQn);
-    // NVIC_EnableIRQ(GPDMA0_3_IRQn);
-    // NVIC_EnableIRQ(GPDMA0_4_IRQn);
-    // NVIC_EnableIRQ(GPDMA0_5_IRQn);
-    // NVIC_EnableIRQ(GPDMA0_6_IRQn);
-    // NVIC_EnableIRQ(GPDMA0_7_IRQn);
+    XMC_DMA_CH_EnableEvent(DMA_CH0_HW, CCU4_DMA_CH0, XMC_DMA_CH_EVENT_BLOCK_TRANSFER_COMPLETE); // Enables Block Transfer Event
+    XMC_DMA_CH_Enable(DMA_CH0_HW, CCU4_DMA_CH0);            // Enable the DMA for timer compare registers
+    XMC_DMA_CH_Enable(DMA_CH1_HW, SHADOW_TRANSFER_DMA_CH1); // Enable the DMA for the shadow transfer enable
+    // XMC_CCU4_SLICE_StartTimer(CCU40_CC40); // Start the PWM
+    XMC_CCU4_SLICE_StartTimer(CCU40_CC41); // Start the PWM_MASTER_CLOCK (which triggers the PWM_OUTPUT which is configured as one shot)
 
-    build_instruction_cards();
-
-    
-
-    // THIS IS FOR A TEST
-    for (unsigned speaker = 0; speaker < NUM_SPEAKERS; speaker++) {
-        for (unsigned sample = 0; sample < NUM_SAMPLES; sample++){
-            audio_buffer[0][speaker][sample] = test_bin[sample];
-        }
+    while(true){
+        
+        // __DSB(); // Data Synchronization Barrier
+        // __WFI(); // Wait For Interrupt
     }
+/////////////////////////////////////////
+
+    // loop = true;
+
+    // buffer_to_load = 0;
+
+    // src_audio_index = 0;
+    // src_audio_size = piano_note_bin_len / 2; // piano_note_bin_len size in bytes / 2 bytes per 16 bit val
+
+    // dma_load_source_audio(DMA_CH2_HW, SOURCE_DMA_CH2, (uint32_t) piano_note_bin, (uint32_t)source_audio_buffer[buffer_to_load]); // DMA fills source_audio_buffer[0]
+    // // buffer_to_load = !buffer_to_load;
+    // while (XMC_DMA_CH_IsEnabled(DMA_CH2_HW, SOURCE_DMA_CH2)){} // Wait for  source_audio_buffer[0] to be filled
+
+
+    // dma_load_source_audio(DMA_CH2_HW, SOURCE_DMA_CH2, (uint32_t) piano_note_bin + (256 * 2), (uint32_t)source_audio_buffer[buffer_to_load]); // DMA fills source_audio_buffer[1]
+    // // buffer_to_load = !buffer_to_load;
+    // fill_buffer(buffer_to_load);
+    // while (XMC_DMA_CH_IsEnabled(DMA_CH2_HW, SOURCE_DMA_CH2)){} // Just to make sure that DMA finished filling source_audio_buffer[1]
+
+
+    // dma_load_source_audio(DMA_CH2_HW, SOURCE_DMA_CH2, (uint32_t) piano_note_bin + (512 * 2), (uint32_t)source_audio_buffer[buffer_to_load]); // DMA fills source_audio_buffer[0]
+    // // buffer_to_load = !buffer_to_load;
     
+    // // Enable the DMA channel to initiate transfer + Start the timer for the PWM
+    // NVIC_EnableIRQ(GPDMA0_0_IRQn); // one channel for now
+    // XMC_DMA_CH_EnableEvent(DMA_CH0_HW, CCU4_DMA_CH0, XMC_DMA_CH_EVENT_BLOCK_TRANSFER_COMPLETE); // Enables Block Transfer Event
+    // XMC_DMA_CH_Enable(DMA_CH0_HW, CCU4_DMA_CH0);            // Enable the DMA for timer compare registers
+    // XMC_DMA_CH_Enable(DMA_CH1_HW, SHADOW_TRANSFER_DMA_CH1); // Enable the DMA for the shadow transfer enable
+    // XMC_CCU4_SLICE_StartTimer(CCU40_CC40); // Start the PWM
+    
+    // fill_buffer(buffer_to_load);
 
+    // while(true){
+        
+    //     // __DSB(); // Data Synchronization Barrier
+    //     // __WFI(); // Wait For Interrupt
+    // }
 
-    // int16_t* audio_file = (int16_t*)(piano_note_bin);
+    ///////////////////////////////////
 
-    // start the necessary timers
+    // This is for testing, but can be modified to be a function
+    
+    
+    // // NVIC_EnableIRQ(GPDMA0_1_IRQn);
+    // // NVIC_EnableIRQ(GPDMA0_2_IRQn);
+    // // NVIC_EnableIRQ(GPDMA0_3_IRQn);
+    // // NVIC_EnableIRQ(GPDMA0_4_IRQn);
+    // // NVIC_EnableIRQ(GPDMA0_5_IRQn);
+    // // NVIC_EnableIRQ(GPDMA0_6_IRQn);
+    // // NVIC_EnableIRQ(GPDMA0_7_IRQn);
+
+    // build_instruction_cards();
 
     // SCB->SCR &= ~SCB_SCR_SLEEPDEEP_Msk;
     
-    for (;;)
-    {
-        // __DSB(); // Data Synchronization Barrier
-        // __WFI(); // Wait For Interrupt
-        
-    }
 }
 
 /* [] END OF FILE */
 
+
+#define PWM_PERIOD_TICKS 3600
+static uint32_t duty_to_cr(float duty)
+{
+  if (duty < 0.0f) { duty = 0.0f; }
+  if (duty > 1.0f) { duty = 1.0f; }
+  uint32_t on_ticks = (uint32_t)((duty * (float)PWM_PERIOD_TICKS) + 0.5f);
+  if (on_ticks > PWM_PERIOD_TICKS) { on_ticks = PWM_PERIOD_TICKS; }
+  return PWM_PERIOD_TICKS - on_ticks;
+}
+
+void fill_buffer_with_sine(){
+    const float two_pi = 6.28318530718f;
+    #define BLOCK_SIZE 256
+    for (uint32_t k = 0U; k < BLOCK_SIZE; k++) {
+        float s = sinf(two_pi * ((float)k/2.0f)/( (float)BLOCK_SIZE));
+        uint32_t duty = duty_to_cr(0.50f + (0.40f * s));
+        audio_buffer[0][k] = duty / 2;
+    }
+
+    for (uint32_t k = 0U; k < BLOCK_SIZE; k++) {
+        float s = sinf(two_pi * ((float)(k + BLOCK_SIZE)/2.0f)/( (float)BLOCK_SIZE));
+        uint32_t duty = duty_to_cr(0.50f + (0.40f * s));
+        audio_buffer[1][k] = (duty / 2);
+    }
+}
+
+
+// // Two instruction cards telling DAC DMA which buffer to play.
+// static XMC_DMA_LLI_t blocks[NUM_SPEAKERS][2]; // 2 buffers for each speaker output
+
+// void build_instruction_cards(void){
+
+//   //build 2 instruction cards
+//   for (unsigned speaker = 0; speaker < NUM_SPEAKERS; speaker++) {
+//     for (unsigned i = 0; i < 2; ++i){
+
+//         // First sample for each block
+//         blocks[speaker][i].src_addr = (uint32_t)&audio_buffer[i][speaker];
+
+//         // Create a linked list of all the blocks
+//         blocks[speaker][i].llp = (i < 1) ? &blocks[speaker][i + 1] : &blocks[speaker][0];
+        
+//         // Transfer settings from Device Configurator
+//         if (speaker == 0)      blocks[speaker][i].control = gpdma_0_ch_0_config.control;
+//         else if (speaker == 1) blocks[speaker][i].control = gpdma_0_ch_1_config.control;
+//         else if (speaker == 2) blocks[speaker][i].control = gpdma_0_ch_2_config.control;
+//         else if (speaker == 3) blocks[speaker][i].control = gpdma_0_ch_3_config.control;
+//         else if (speaker == 4) blocks[speaker][i].control = gpdma_0_ch_4_config.control;
+//         else if (speaker == 5) blocks[speaker][i].control = gpdma_0_ch_5_config.control;
+//         else if (speaker == 6) blocks[speaker][i].control = gpdma_0_ch_6_config.control;
+//         else if (speaker == 7) blocks[speaker][i].control = gpdma_0_ch_7_config.control;
+
+//         blocks[speaker][i].block_size = 256;
+
+//         // The two block should link to each other
+//         blocks[speaker][i].enable_src_linked_list = 1;
+        
+//     }
+
+//   }
+
+//   // Point DMA at the first instruction card.
+//   XMC_DMA_CH_SetLinkedListPointer(XMC_DMA0, speaker0_dma_ch, blocks[speaker0_dma_ch]); // just one channel for now
+// //   XMC_DMA_CH_SetLinkedListPointer(XMC_DMA0, speaker1_dma_ch, blocks);
+// //   XMC_DMA_CH_SetLinkedListPointer(XMC_DMA0, speaker2_dma_ch, blocks);
+// //   XMC_DMA_CH_SetLinkedListPointer(XMC_DMA0, speaker3_dma_ch, blocks);
+// //   XMC_DMA_CH_SetLinkedListPointer(XMC_DMA0, speaker4_dma_ch, blocks);
+// //   XMC_DMA_CH_SetLinkedListPointer(XMC_DMA0, speaker5_dma_ch, blocks);
+// //   XMC_DMA_CH_SetLinkedListPointer(XMC_DMA0, speaker6_dma_ch, blocks);
+// //   XMC_DMA_CH_SetLinkedListPointer(XMC_DMA0, speaker7_dma_ch, blocks);
+
+// }
 
 
 
