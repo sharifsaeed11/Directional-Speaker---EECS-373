@@ -46,7 +46,9 @@
 
 #include "audio.h"
 #include "xmc_ccu4.h"
-#include "xmc_i2s.h"
+#include "xmc_ccu8.h"
+#include <stdio.h>
+
 
 #define XMC4700_SPEED_HZ 144000000
 #define SIGNAL_FREQUENCY 40000
@@ -60,6 +62,19 @@
 #define TOTAL_SAMPLES_BYTES NUM_SAMPLES * BYTES_PER_SAMPLE
 
 #define NUM_SPEAKERS 1 // Number of potentional elements in the array
+
+int _write(int file, char *ptr, int len)
+{
+   (void)file;
+   for (int i = 0; i < len; i++){
+       if (ptr[i] == '\n'){
+           XMC_UART_CH_Transmit(CYBSP_DEBUG_UART_HW, '\r');
+       }
+       XMC_UART_CH_Transmit(CYBSP_DEBUG_UART_HW, ptr[i]);
+   }
+   return len;
+}
+
 
 
 
@@ -90,142 +105,6 @@ volatile bool sampling = false;
 // These are aliases for source and destination addresses that the XMC configurator will use for the DMA channel
 uint32_t *shadow_transfer_src_ptr = &shadow_transfer_enable;
 uint32_t *shadow_transfer_dst_ptr = (uint32_t *)&(CCU40->GCSS);
-
-#define GCSS_ALL (CCU4_GCSS_S0SE_Msk | CCU4_GCSS_S1SE_Msk | CCU4_GCSS_S2SE_Msk | CCU4_GCSS_S3SE_Msk)
-
-// //////////////
-
-
-#include <xmc_dma.h>
-
-#define REFRESH_SEL  7u   /* DLR RS0 code for the refresh trigger (from RM DLR table) */
-
-/* CTLL: 32-bit src/dst, no address increment, LLP enabled on src+dst */
-#define CTLL_BASE ((2u << 1) | (2u << 4) | (2u << 7) | (2u << 9) | (1u << 27) | (1u << 28))
-#define CTLL_M2P  (1u << 20)   /* waits for HW request */
-#define CTLL_M2M  (0u << 20)   /* runs immediately     */
-
-typedef struct { uint32_t sar, dar, llp, ctll, ctlh; } dma_lli_t;
-
-uint32_t gcss_mask[4] = { GCSS_ALL, GCSS_ALL, GCSS_ALL, GCSS_ALL };
-dma_lli_t lli_shadow[4] __attribute__((aligned(4)));
-
-void gcss_refresh_dma_init(void)
-{
-  static CCU4_GLOBAL_TypeDef *const mod[4] = { CCU40, CCU41, CCU42, CCU43 };
-
-  /* 4 LLIs in a loop: LLI0 waits for trigger, LLI1-3 follow immediately */
-  for (uint32_t i = 0; i < 4; i++) {
-    lli_shadow[i].sar  = (uint32_t)&gcss_mask[i];
-    lli_shadow[i].dar  = (uint32_t)&mod[i]->GCSS;
-    lli_shadow[i].llp  = (uint32_t)&lli_shadow[(i + 1u) & 3u];
-    lli_shadow[i].ctll = CTLL_BASE | ((i == 0u) ? CTLL_M2P : CTLL_M2M);
-    lli_shadow[i].ctlh = 1u;                                       /* BLOCK_TS = 1 */
-  }
-
-  XMC_DMA_Init(XMC_DMA0);
-
-//   /* Refresh trigger -> DLR line 0 */
-//   DLR->SRSEL0 = (DLR->SRSEL0 & ~DLR_SRSEL0_RS0_Msk) | (REFRESH_SEL << DLR_SRSEL0_RS0_Pos);
-//   DLR->LNEN  |= 1u << 0;
-    /* Refresh trigger -> DLR line 1 */
-  DLR->SRSEL0 = (DLR->SRSEL0 & ~DLR_SRSEL0_RS1_Msk) | (REFRESH_SEL << DLR_SRSEL0_RS1_Pos);
-  DLR->LNEN  |= 1u << 1;
-
-//   /* GPDMA0 ch0: hardware handshake on line 0, start from LLI0 */
-//   GPDMA0_CH1->CFGL = 0;
-//   GPDMA0_CH1->CFGH = 0u << GPDMA0_CH_CFGH_DEST_PER_Pos;
-//   GPDMA0_CH1->LLP  = (uint32_t)&lli_shadow[0];
-//   GPDMA0_CH1->CTLL = (1u << 27) | (1u << 28);
-//   GPDMA0_CH1->CTLH = 0;
-  /* GPDMA0 ch1: hardware handshake on line 1, start from LLI0 */
-  GPDMA0_CH1->CFGL = 0;
-  GPDMA0_CH1->CFGH = 1u << GPDMA0_CH_CFGH_DEST_PER_Pos;
-  GPDMA0_CH1->LLP  = (uint32_t)&lli_shadow[0];
-  GPDMA0_CH1->CTLL = (1u << 27) | (1u << 28);
-  GPDMA0_CH1->CTLH = 0;
-
-//   GPDMA0->CHENREG = (1u << 0) | (1u << 8);                  /* enable ch0 */
-  GPDMA0->CHENREG = (1u << 1) | (1u << 9);                  /* enable ch1 */
-}
-
-// //////////////////////////
-
-
-// #define GCSS_ALL (CCU4_GCSS_S0SE_Msk | CCU4_GCSS_S1SE_Msk | CCU4_GCSS_S2SE_Msk | CCU4_GCSS_S3SE_Msk)
-
-uint32_t shadow_enable_all = GCSS_ALL;
-uint32_t* shadow_enable_mask_ptr = &shadow_enable_all;
-
-// __attribute__((aligned(32))) XMC_DMA_LLI_t dma_ll_shadow[4] =
-// {
-//   {
-//     .block_size = 1,                                            /* Transfer Block size */
-//     // .src_addr = (uint32_t)&audio_buffer[0][0],                            /* Source address */
-//     .dst_addr = (uint32_t)&(CCU40->GCSS),                                /* Destination address */
-//     .llp = &dma_ll_shadow[1],                                                   /* Linked list pointer of type XMC_DMA_LLI_t */
-//     .src_transfer_width = XMC_DMA_CH_TRANSFER_WIDTH_32,                  /* Source transfer width */
-//     .dst_transfer_width = XMC_DMA_CH_TRANSFER_WIDTH_32,                  /* Destination transfer width */
-//     // .src_address_count_mode = XMC_DMA_CH_ADDRESS_COUNT_MODE_INCREMENT,   /* Source address count mode */
-//     .dst_address_count_mode = XMC_DMA_CH_ADDRESS_COUNT_MODE_NO_CHANGE,   /* Destination address count mode */
-//     .dst_burst_length = XMC_DMA_CH_BURST_LENGTH_1,                       /* Destination burst length */
-//     .src_burst_length = XMC_DMA_CH_BURST_LENGTH_1,                       /* Source burst length */
-//     .transfer_flow = XMC_DMA_CH_TRANSFER_FLOW_M2P_DMA,                   /* DMA Transfer flow */
-//     // .enable_src_linked_list = true,                                      /* Enable source linked list? */
-//     .enable_dst_linked_list = true,                                      /* Enable destination linked list? */
-//     // .enable_interrupt = true,
-//   },
-//   {
-//     .block_size = 1,                                            /* Transfer Block size */
-//     // .src_addr = (uint32_t)&audio_buffer[1][0],                            /* Source address */
-//     .dst_addr = (uint32_t)&(CCU41->GCSS),                                /* Destination address */
-//     .llp = &dma_ll_shadow[2],                                                   /* Linked list pointer of type XMC_DMA_LLI_t */
-//     .src_transfer_width = XMC_DMA_CH_TRANSFER_WIDTH_32,                  /* Source transfer width */
-//     .dst_transfer_width = XMC_DMA_CH_TRANSFER_WIDTH_32,                  /* Destination transfer width */
-//     // .src_address_count_mode = XMC_DMA_CH_ADDRESS_COUNT_MODE_INCREMENT,   /* Source address count mode */
-//     .dst_address_count_mode = XMC_DMA_CH_ADDRESS_COUNT_MODE_NO_CHANGE,   /* Destination address count mode */
-//     .src_burst_length = XMC_DMA_CH_BURST_LENGTH_1,                       /* Source burst length */
-//     .dst_burst_length = XMC_DMA_CH_BURST_LENGTH_1,                       /* Destination burst length */
-//     .transfer_flow = XMC_DMA_CH_TRANSFER_FLOW_M2P_DMA,                   /* DMA Transfer flow */
-//     // .enable_src_linked_list = true,                                      /* Enable source linked list? */
-//     .enable_dst_linked_list = true,                                      /* Enable destination linked list? */
-//     // .enable_interrupt = true,  
-//   },
-//   {
-//     .block_size = 1,                                            /* Transfer Block size */
-//     // .src_addr = (uint32_t)&audio_buffer[1][0],                            /* Source address */
-//     .dst_addr = (uint32_t)&(CCU42->GCSS),                                /* Destination address */
-//     .llp = &dma_ll_shadow[3],                                                   /* Linked list pointer of type XMC_DMA_LLI_t */
-//     .src_transfer_width = XMC_DMA_CH_TRANSFER_WIDTH_32,                  /* Source transfer width */
-//     .dst_transfer_width = XMC_DMA_CH_TRANSFER_WIDTH_32,                  /* Destination transfer width */
-//     // .src_address_count_mode = XMC_DMA_CH_ADDRESS_COUNT_MODE_INCREMENT,   /* Source address count mode */
-//     .dst_address_count_mode = XMC_DMA_CH_ADDRESS_COUNT_MODE_NO_CHANGE,   /* Destination address count mode */
-//     .src_burst_length = XMC_DMA_CH_BURST_LENGTH_1,                       /* Source burst length */
-//     .dst_burst_length = XMC_DMA_CH_BURST_LENGTH_1,                       /* Destination burst length */
-//     .transfer_flow = XMC_DMA_CH_TRANSFER_FLOW_M2P_DMA,                   /* DMA Transfer flow */
-//     // .enable_src_linked_list = true,                                      /* Enable source linked list? */
-//     .enable_dst_linked_list = true,                                      /* Enable destination linked list? */
-//     // .enable_interrupt = true,  
-//   },
-//   {
-//     .block_size = 1,                                            /* Transfer Block size */
-//     // .src_addr = (uint32_t)&audio_buffer[1][0],                            /* Source address */
-//     .dst_addr = (uint32_t)&(CCU43->GCSS),                                /* Destination address */
-//     .llp = &dma_ll_shadow[0],                                                   /* Linked list pointer of type XMC_DMA_LLI_t */
-//     .src_transfer_width = XMC_DMA_CH_TRANSFER_WIDTH_32,                  /* Source transfer width */
-//     .dst_transfer_width = XMC_DMA_CH_TRANSFER_WIDTH_32,                  /* Destination transfer width */
-//     // .src_address_count_mode = XMC_DMA_CH_ADDRESS_COUNT_MODE_INCREMENT,   /* Source address count mode */
-//     .dst_address_count_mode = XMC_DMA_CH_ADDRESS_COUNT_MODE_NO_CHANGE,   /* Destination address count mode */
-//     .src_burst_length = XMC_DMA_CH_BURST_LENGTH_1,                       /* Source burst length */
-//     .dst_burst_length = XMC_DMA_CH_BURST_LENGTH_1,                       /* Destination burst length */
-//     .transfer_flow = XMC_DMA_CH_TRANSFER_FLOW_M2P_DMA,                   /* DMA Transfer flow */
-//     // .enable_src_linked_list = true,                                      /* Enable source linked list? */
-//     .enable_dst_linked_list = true,                                      /* Enable destination linked list? */
-//     .enable_interrupt = true,  
-//   }
-// };
-// XMC_DMA_LLI_t *LLP_for_shadow = &dma_ll_shadow[0];
-
 
 __attribute__((aligned(32))) XMC_DMA_LLI_t dma_ll_ccu4[2] =
 {
@@ -265,9 +144,12 @@ __attribute__((aligned(32))) XMC_DMA_LLI_t dma_ll_ccu4[2] =
 
 XMC_DMA_LLI_t *LLP_for_timer = &dma_ll_ccu4[0]; // This basicaly does XMC_DMA_CH_SetLinkedListPointer(XMC_DMA#, dma channel, first instruction card);
 
+// #define ADC_GROUP    VADC_G0
+// #define ADC_CH       0U        /* G0CH0 = P14.0 */
+// #define ADC_RES_REG  0U
 
-#define ADC_GROUP    VADC_G0
-#define ADC_CH       0U        /* G0CH0 = P14.0 */
+#define ADC_GROUP    VADC_G1
+#define ADC_CH       0U        /* G1CH0 = P14.8 */
 #define ADC_RES_REG  0U
 
 
@@ -304,13 +186,23 @@ inline uint16_t signed_pcm_to_compare_val(int16_t pcm_val){ // This is a fast wa
 #define VOLTAGE_BIAS ((4095U - 1U) / VAREF) * 1425U // in mV
 #define VOLT_BIAS 1762
 
- uint16_t voltage_to_compare_val(int16_t voltage_val){ // This is a fast way to do the conversion
+uint16_t voltage_to_compare_val(int16_t voltage_val){ // This is a fast way to do the conversion
     
     int16_t val = ((voltage_val - VOLTAGE_BIAS) << 4); // approximately removes voltage bias, then scales value to 16 bit
 
     uint32_t result = (uint32_t) (((val + 32768U) * CENTER_ALIGNED_TIMER_PERIOD) >> 16);
 
     return CENTER_ALIGNED_TIMER_PERIOD - result;
+
+}
+
+uint16_t voltage_to_compare_val_edge_aligned(int16_t voltage_val){ // This is a fast way to do the conversion
+    
+    int16_t val = ((voltage_val - VOLTAGE_BIAS) << 4); // approximately removes voltage bias, then scales value to 16 bit
+
+    uint32_t result = (uint32_t) (((val + 32768U) * EDGE_ALIGNED_TIMER_PERIOD) >> 16);
+
+    return EDGE_ALIGNED_TIMER_PERIOD - result;
 
 }
 
@@ -329,7 +221,8 @@ void fill_buffer(uint32_t buffer_index){
             val = 1.0f * val; // This is just to adjust the volume if the audio is too quiet
            
             if (sampling) {
-                audio_buffer[buffer_index][i] = voltage_to_compare_val(val);
+                // audio_buffer[buffer_index][i] = voltage_to_compare_val(val);
+                audio_buffer[buffer_index][i] = voltage_to_compare_val_edge_aligned(val);
             }
             else {
                 audio_buffer[buffer_index][i] = signed_pcm_to_compare_val(val);
@@ -346,10 +239,22 @@ void fill_buffer(uint32_t buffer_index){
 #define DMA_CH1_HW XMC_DMA0
 #define DMA_CH2_HW XMC_DMA0
 #define DMA_CH3_HW XMC_DMA0
+#define DMA_CH4_HW XMC_DMA0
+#define ADC_DMA_CH2_HW XMC_DMA1
 #define CCU4_DMA_CH0 0
+#define CCU4_DMA_CH4 4
+
+#define CCU4_1_DMA_CH 2
+#define CCU4_3_DMA_CH 6
+#define CCU4_4_DMA_CH 1
+#define CCU4_5_DMA_CH 1
+#define CCU4_6_DMA_CH 5
+#define CCU4_7_DMA_CH 7
+
 #define SHADOW_TRANSFER_DMA_CH1 1
 #define SOURCE_DMA_CH2 2
 #define SOURCE_DMA_CH3 3
+#define ADC_DMA_CH2 2
 
 void dma_load_source_audio(XMC_DMA_t* dma_group, uint8_t dma_channel, uint32_t src_addr, uint32_t dst_addr){
 
@@ -361,9 +266,14 @@ void dma_load_source_audio(XMC_DMA_t* dma_group, uint8_t dma_channel, uint32_t s
 
 }
 
+volatile bool fill_next_buffer = false; //
 
+
+// This is the main synchronization interupt tied to DMA Channel 0
+// Only DMA channel 0 is configured as using multi-block linked list, so this interrupt tells us when one part of the buffer is filled
+// The rest of the DMA channels are configured as single block, so this interrupt tells us when we need to start filling in the next part of the buffer
 void gpdma_0_ch_0_EventHandler(XMC_DMA_CH_EVENT_t event){
-    
+
     if (event != XMC_DMA_CH_EVENT_BLOCK_TRANSFER_COMPLETE) return;
 
     if (source_index < source_size || sampling) {
@@ -371,16 +281,17 @@ void gpdma_0_ch_0_EventHandler(XMC_DMA_CH_EVENT_t event){
         // while (XMC_DMA_CH_IsEnabled(DMA_CH2_HW, SOURCE_DMA_CH2) || XMC_DMA_CH_IsEnabled(DMA_CH3_HW, SOURCE_DMA_CH3)){} // Just to make sure DMA is finished
         
         // Set the DMA to get the next chunk of audio values from source
-
         if (sampling) {
             while (XMC_DMA_CH_IsEnabled(DMA_CH3_HW, SOURCE_DMA_CH3)){}
             dma_load_source_audio(DMA_CH3_HW, SOURCE_DMA_CH3, (uint32_t) adc_source, (uint32_t) source_buffer[buffer_to_load]);
         }
         else dma_load_source_audio(DMA_CH2_HW, SOURCE_DMA_CH2, (uint32_t)(piano_note_bin + ((source_index + 256) * 2)), (uint32_t) source_buffer[buffer_to_load]);
+        // Need to fix this else statement since its based on older code
 
+        // This triggers the PendSV interrupt where the audio will get processed (it is the lowest priority interrupt)
+        SCB->ICSR |= SCB_ICSR_PENDSVSET_Msk; // I don't really know what this means (I just found this online)
+        
 
-        // // Process source buffer into audio buffer
-        fill_buffer(buffer_to_load);
 
     }
     else if (loop) {
@@ -412,11 +323,126 @@ void gpdma_0_ch_0_EventHandler(XMC_DMA_CH_EVENT_t event){
 
 }
 
+// DMA re-trigger handler for PWM_OUTPUT_4
+uint32_t* source_buffer_ccu4_4 = (uint32_t*) &audio_buffer[0];
+uint32_t* ccu4_4_dest = (uint32_t*)&(CCU42_CC40->CRS);
+
+void gpdma_0_ch_1_EventHandler(XMC_DMA_CH_EVENT_t event) {
+    /* 1. Clear the block and transfer complete interrupt flags */
+    XMC_DMA_CH_ClearEventStatus(XMC_DMA0, CCU4_4_DMA_CH, XMC_DMA_CH_EVENT_TRANSFER_COMPLETE | XMC_DMA_CH_EVENT_BLOCK_TRANSFER_COMPLETE);
+    XMC_DMA_CH_SetDestinationAddress(XMC_DMA0, CCU4_4_DMA_CH, (uint32_t) ccu4_4_dest);
+    XMC_DMA_CH_SetSourceAddress(XMC_DMA0, CCU4_4_DMA_CH, (uint32_t) source_buffer_ccu4_4);
+    XMC_DMA_CH_Enable(XMC_DMA0, CCU4_4_DMA_CH);
+}
+
+// DMA re-trigger handler for PWM_OUTPUT_1
+uint32_t* source_buffer_ccu4_1 = (uint32_t*) &audio_buffer[0];
+uint32_t* ccu4_1_dest = (uint32_t*)&(CCU40_CC42->CRS);
+
+void gpdma_0_ch_2_EventHandler(XMC_DMA_CH_EVENT_t event) {
+
+    /* 1. Clear the block and transfer complete interrupt flags */
+    XMC_DMA_CH_ClearEventStatus(XMC_DMA0, CCU4_1_DMA_CH, XMC_DMA_CH_EVENT_TRANSFER_COMPLETE | XMC_DMA_CH_EVENT_BLOCK_TRANSFER_COMPLETE);
+    XMC_DMA_CH_SetDestinationAddress(XMC_DMA0, CCU4_1_DMA_CH, (uint32_t) ccu4_1_dest);
+    XMC_DMA_CH_SetSourceAddress(XMC_DMA0, CCU4_1_DMA_CH, (uint32_t) source_buffer_ccu4_1);
+    XMC_DMA_CH_Enable(XMC_DMA0, CCU4_1_DMA_CH);
+}
+
+// DMA re-trigger handler for PWM_OUTPUT_6
+uint32_t* source_buffer_ccu4_6 = (uint32_t*) &audio_buffer[0];
+uint32_t* ccu4_6_dest = (uint32_t*)&(CCU43_CC40->CRS);
+
+void gpdma_0_ch_5_EventHandler(XMC_DMA_CH_EVENT_t event) {
+
+    /* 1. Clear the block and transfer complete interrupt flags */
+    XMC_DMA_CH_ClearEventStatus(XMC_DMA0, CCU4_6_DMA_CH, XMC_DMA_CH_EVENT_TRANSFER_COMPLETE | XMC_DMA_CH_EVENT_BLOCK_TRANSFER_COMPLETE);
+    XMC_DMA_CH_SetDestinationAddress(XMC_DMA0, CCU4_6_DMA_CH, (uint32_t) ccu4_6_dest);
+    XMC_DMA_CH_SetSourceAddress(XMC_DMA0, CCU4_6_DMA_CH, (uint32_t) source_buffer_ccu4_6);
+    XMC_DMA_CH_Enable(XMC_DMA0, CCU4_6_DMA_CH);
+}
+
+// DMA re-trigger handler for PWM_OUTPUT_3
+uint32_t* source_buffer_ccu4_3 = (uint32_t*) &audio_buffer[0];
+uint32_t* ccu4_3_dest = (uint32_t*)&(CCU41_CC42->CRS);
+
+void gpdma_0_ch_6_EventHandler(XMC_DMA_CH_EVENT_t event) {
+
+    /* 1. Clear the block and transfer complete interrupt flags */
+    XMC_DMA_CH_ClearEventStatus(XMC_DMA0, CCU4_3_DMA_CH, XMC_DMA_CH_EVENT_TRANSFER_COMPLETE | XMC_DMA_CH_EVENT_BLOCK_TRANSFER_COMPLETE);
+    XMC_DMA_CH_SetDestinationAddress(XMC_DMA0, CCU4_3_DMA_CH, (uint32_t) ccu4_3_dest);
+    XMC_DMA_CH_SetSourceAddress(XMC_DMA0, CCU4_3_DMA_CH, (uint32_t) source_buffer_ccu4_3);
+    XMC_DMA_CH_Enable(XMC_DMA0, CCU4_3_DMA_CH);
+}
+
+// DMA re-trigger handler for PWM_OUTPUT_7
+uint32_t* source_buffer_ccu4_7 = (uint32_t*) &audio_buffer[0];
+uint32_t* ccu4_7_dest = (uint32_t*)&(CCU43_CC42->CRS);
+
+void gpdma_0_ch_7_EventHandler(XMC_DMA_CH_EVENT_t event) {
+
+
+    /* 1. Clear the block and transfer complete interrupt flags */
+    XMC_DMA_CH_ClearEventStatus(XMC_DMA0, CCU4_7_DMA_CH, XMC_DMA_CH_EVENT_TRANSFER_COMPLETE | XMC_DMA_CH_EVENT_BLOCK_TRANSFER_COMPLETE);
+    XMC_DMA_CH_SetDestinationAddress(XMC_DMA0, CCU4_7_DMA_CH, (uint32_t) ccu4_7_dest);
+    XMC_DMA_CH_SetSourceAddress(XMC_DMA0, CCU4_7_DMA_CH, (uint32_t) source_buffer_ccu4_7);
+    XMC_DMA_CH_Enable(XMC_DMA1, CCU4_7_DMA_CH);
+}
+
+// DMA re-trigger handler for PWM_OUTPUT_5
+uint32_t* source_buffer_ccu4_5 = (uint32_t*) &audio_buffer[0];
+uint32_t* ccu4_5_dest = (uint32_t*)&(CCU42_CC42->CRS);
+
+void gpdma_1_ch_1_EventHandler(XMC_DMA_CH_EVENT_t event) {
+
+    /* 1. Clear the block and transfer complete interrupt flags */
+    XMC_DMA_CH_ClearEventStatus(XMC_DMA1, CCU4_5_DMA_CH, XMC_DMA_CH_EVENT_TRANSFER_COMPLETE | XMC_DMA_CH_EVENT_BLOCK_TRANSFER_COMPLETE);
+    XMC_DMA_CH_SetDestinationAddress(XMC_DMA1, CCU4_5_DMA_CH, (uint32_t) ccu4_5_dest);
+    XMC_DMA_CH_SetSourceAddress(XMC_DMA1, CCU4_5_DMA_CH, (uint32_t) source_buffer_ccu4_5);
+    XMC_DMA_CH_Enable(XMC_DMA1, CCU4_5_DMA_CH);
+}
+
+
+// DMA re-trigger handler for PWM_OUTPUT_2
+uint32_t* source_buffer_ccu4_2 = (uint32_t*) &audio_buffer[0];
+uint32_t* ccu4_2_dest = (uint32_t*)&(CCU41_CC40->CRS);
+
+void gpdma_0_ch_4_EventHandler(XMC_DMA_CH_EVENT_t event) {
+    /* 1. Clear the block and transfer complete interrupt flags */
+    XMC_DMA_CH_ClearEventStatus(XMC_DMA0, CCU4_DMA_CH4, XMC_DMA_CH_EVENT_TRANSFER_COMPLETE | XMC_DMA_CH_EVENT_BLOCK_TRANSFER_COMPLETE);
+    XMC_DMA_CH_SetDestinationAddress(XMC_DMA0, CCU4_DMA_CH4, (uint32_t) ccu4_2_dest);
+    XMC_DMA_CH_SetSourceAddress(XMC_DMA0, CCU4_DMA_CH4, (uint32_t) source_buffer_ccu4_2);
+    XMC_DMA_CH_Enable(XMC_DMA0, CCU4_DMA_CH4);
+}
+
 // Pass DMA interrupts to the library, which calls our callback.
 void GPDMA0_0_IRQHandler(void){
    XMC_DMA_IRQHandler(XMC_DMA0);
 }
 
+void GPDMA1_0_IRQHandler(void){
+   XMC_DMA_IRQHandler(XMC_DMA1);
+}
+
+#define GCSS_ALL (CCU4_GCSS_S0SE_Msk | CCU4_GCSS_S1SE_Msk | CCU4_GCSS_S2SE_Msk | CCU4_GCSS_S3SE_Msk)
+
+volatile uint32_t* ccu4_gcss0 = (uint32_t *)&(CCU40->GCSS);
+volatile uint32_t* ccu4_gcss1 = (uint32_t *)&(CCU41->GCSS);
+volatile uint32_t* ccu4_gcss2 = (uint32_t *)&(CCU42->GCSS);
+volatile uint32_t* ccu4_gcss3 = (uint32_t *)&(CCU43->GCSS);
+
+void CCU80_0_IRQHandler(XMC_CCU8_SLICE_EVENT_t event){
+    *ccu4_gcss0 = GCSS_ALL;
+    *ccu4_gcss1 = GCSS_ALL;
+    *ccu4_gcss2 = GCSS_ALL;
+    *ccu4_gcss3 = GCSS_ALL;
+}
+
+volatile uint32_t* compare_val_0 = (uint32_t *)&(CCU40_CC40->CR);
+volatile uint32_t* compare_val_1 = (uint32_t *)&(CCU41_CC40->CR);
+
+void PendSV_Handler(void) {
+    fill_buffer(buffer_to_load);
+}
 
 int main(void)
  {
@@ -438,22 +464,96 @@ int main(void)
     reset_audio_buffer(1);
 
     
+    // Set PendSV to the lowest priority so it doesn't block hardware ISRs
+    NVIC_SetPriority(PendSV_IRQn, 0xFF);
+
 
     // Enable the DMA channel to initiate transfer + Start the timer for the PWM
+    NVIC_SetPriority(GPDMA0_0_IRQn, 1U);
     NVIC_EnableIRQ(GPDMA0_0_IRQn); // one channel for now
+    
+    /////////////////////
+    NVIC_SetPriority(GPDMA1_0_IRQn, 1U);
+    NVIC_EnableIRQ(GPDMA1_0_IRQn);
+    /////////////////////
+
     XMC_DMA_CH_EnableEvent(DMA_CH0_HW, CCU4_DMA_CH0, XMC_DMA_CH_EVENT_BLOCK_TRANSFER_COMPLETE); // Enables Block Transfer Event
+
+    XMC_DMA_CH_EnableEvent(DMA_CH4_HW, CCU4_DMA_CH4, XMC_DMA_CH_EVENT_BLOCK_TRANSFER_COMPLETE); // Enables Block Transfer Event
+
+    /////////////////////
+    XMC_DMA_CH_EnableEvent(XMC_DMA0, CCU4_1_DMA_CH, XMC_DMA_CH_EVENT_BLOCK_TRANSFER_COMPLETE); // Enables Block Transfer Event
+    XMC_DMA_CH_EnableEvent(XMC_DMA0, CCU4_3_DMA_CH, XMC_DMA_CH_EVENT_BLOCK_TRANSFER_COMPLETE); // Enables Block Transfer Event
+    XMC_DMA_CH_EnableEvent(XMC_DMA0, CCU4_4_DMA_CH, XMC_DMA_CH_EVENT_BLOCK_TRANSFER_COMPLETE); // Enables Block Transfer Event
+    XMC_DMA_CH_EnableEvent(XMC_DMA0, CCU4_6_DMA_CH, XMC_DMA_CH_EVENT_BLOCK_TRANSFER_COMPLETE); // Enables Block Transfer Event
+    // XMC_DMA_CH_EnableEvent(XMC_DMA0, CCU4_7_DMA_CH, XMC_DMA_CH_EVENT_BLOCK_TRANSFER_COMPLETE); // Enables Block Transfer Event
+
+    XMC_DMA_CH_EnableEvent(XMC_DMA1, CCU4_5_DMA_CH, XMC_DMA_CH_EVENT_BLOCK_TRANSFER_COMPLETE); // Enables Block Transfer Event
+    /////////////////////
+
     XMC_DMA_CH_Enable(DMA_CH0_HW, CCU4_DMA_CH0);            // Enable the DMA for timer compare registers
-    XMC_DMA_CH_Enable(DMA_CH1_HW, SHADOW_TRANSFER_DMA_CH1); // Enable the DMA for the shadow transfer enable
-    gcss_refresh_dma_init();
 
-    XMC_CCU4_SLICE_StartTimer(CCU40_CC41); // Start the PWM_MASTER_CLOCK (which triggers the PWM_OUTPUT which is configured as one shot)
+    XMC_DMA_CH_SetDestinationAddress(XMC_DMA0, CCU4_DMA_CH4, (uint32_t) ccu4_2_dest);
+    XMC_DMA_CH_SetSourceAddress(XMC_DMA0, CCU4_DMA_CH4, (uint32_t) source_buffer_ccu4_2);
+    XMC_DMA_CH_Enable(DMA_CH4_HW, CCU4_DMA_CH4); 
 
-    dma_load_source_audio(DMA_CH3_HW, SOURCE_DMA_CH3, (uint32_t) source, (uint32_t)source_buffer[buffer_to_load]); // DMA fills source_buffer[0]
+    /////////////////////
+    XMC_DMA_CH_SetDestinationAddress(XMC_DMA0, CCU4_1_DMA_CH, (uint32_t) ccu4_1_dest);
+    XMC_DMA_CH_SetSourceAddress(XMC_DMA0, CCU4_1_DMA_CH, (uint32_t) source_buffer_ccu4_1);
+    XMC_DMA_CH_Enable(XMC_DMA0, CCU4_1_DMA_CH);
+
+    XMC_DMA_CH_SetDestinationAddress(XMC_DMA0, CCU4_3_DMA_CH, (uint32_t) ccu4_3_dest);
+    XMC_DMA_CH_SetSourceAddress(XMC_DMA0, CCU4_3_DMA_CH, (uint32_t) source_buffer_ccu4_3);
+    XMC_DMA_CH_Enable(XMC_DMA0, CCU4_3_DMA_CH);
+
+    XMC_DMA_CH_SetDestinationAddress(XMC_DMA0, CCU4_4_DMA_CH, (uint32_t) ccu4_4_dest);
+    XMC_DMA_CH_SetSourceAddress(XMC_DMA0, CCU4_4_DMA_CH, (uint32_t) source_buffer_ccu4_4);
+    XMC_DMA_CH_Enable(XMC_DMA0, CCU4_4_DMA_CH);
+
+    XMC_DMA_CH_SetDestinationAddress(XMC_DMA1, CCU4_5_DMA_CH, (uint32_t) ccu4_5_dest);
+    XMC_DMA_CH_SetSourceAddress(XMC_DMA1, CCU4_5_DMA_CH, (uint32_t) source_buffer_ccu4_5);
+    XMC_DMA_CH_Enable(XMC_DMA1, CCU4_5_DMA_CH);
+
+    XMC_DMA_CH_SetDestinationAddress(XMC_DMA0, CCU4_6_DMA_CH, (uint32_t) ccu4_6_dest);
+    XMC_DMA_CH_SetSourceAddress(XMC_DMA0, CCU4_6_DMA_CH, (uint32_t) source_buffer_ccu4_6);
+    XMC_DMA_CH_Enable(XMC_DMA0, CCU4_6_DMA_CH);
+
+    // I will try to see if I can get this last channel working (I will have to manually alter the DMA init)
+    // XMC_DMA_CH_SetDestinationAddress(XMC_DMA0, CCU4_7_DMA_CH, (uint32_t) ccu4_7_dest);
+    // XMC_DMA_CH_SetSourceAddress(XMC_DMA0, CCU4_7_DMA_CH, (uint32_t) source_buffer_ccu4_7);
+    // XMC_DMA_CH_Enable(XMC_DMA0, CCU4_7_DMA_CH);
+    /////////////////////
+
+    // // XMC_DMA_CH_Enable(DMA_CH1_HW, SHADOW_TRANSFER_DMA_CH1); // Enable the DMA for the shadow transfer enable
+    // gcss_refresh_dma_init();
+
+    // XMC_CCU4_SLICE_StartTimer(CCU40_CC41); // Start the PWM_MASTER_CLOCK (which triggers the PWM_OUTPUT which is configured as one shot)
+    dma_load_source_audio(ADC_DMA_CH2_HW, ADC_DMA_CH2, (uint32_t) source, (uint32_t)source_buffer[buffer_to_load]); // NEED TO FIX THIS LINE, PRETTY SURE ITS THE WRONG DMA group
+    
+    NVIC_SetPriority(CCU80_0_IRQn, 0U);
+    NVIC_EnableIRQ(CCU80_0_IRQn); // one channel for now
+    XMC_CCU8_SLICE_StartTimer(CCU80_CC80);
+    // XMC_CCU8_SLICE_SetInterruptNode(CCU80_CC80, XMC_CCU8_SLICE_IRQ_ID_PERIOD_MATCH, XMC_CCU8_SLICE_SR_ID_0);
+    // XMC_CCU8_SLICE_EnableEvent(CCU80_CC80, XMC_CCU8_SLICE_IRQ_ID_PERIOD_MATCH);
+    // XMC_CCU8_SLICE_StartTimer(CCU80_CC80);
+
+    // dma_load_source_audio(DMA_CH3_HW, SOURCE_DMA_CH3, (uint32_t) source, (uint32_t)source_buffer[buffer_to_load]); // DMA fills source_buffer[0]
+    // dma_load_source_audio(ADC_DMA_CH2_HW, ADC_DMA_CH2, (uint32_t) source, (uint32_t)source_buffer[buffer_to_load]); // DMA fills source_buffer[0]
     
     // XMC_CCU4_SLICE_StartTimer(CCU40_CC41); // Start the PWM_MASTER_CLOCK (which triggers the PWM_OUTPUT which is configured as one shot)
 
     // dma_load_source_audio(DMA_CH2_HW, SOURCE_DMA_CH2, (uint32_t) adc_source, (uint32_t)source_buffer[buffer_to_load]); // DMA fills source_buffer[0]
-    while (true){}
+
+    while (true){
+
+        // This just prints out compare values so we can see it on the serial monitor (this is because using the debugger messes up how the code runs)
+        XMC_Delay(1000);
+        uint32_t val0 = *compare_val_0;
+        uint32_t val1 = *compare_val_1;
+
+        printf("%ld, %ld\n", val0, val1);
+
+    }
     //////////////////////////////
 
     loop = true;
