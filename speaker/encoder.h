@@ -19,6 +19,7 @@ typedef struct encoder {
     uint8_t state;
     uint8_t prev_state;
     uint8_t sw_state;
+    int8_t transition_count;
 } Encoder;
 
 // REQUIRES: An Empty Encoder, CLK Port & Pin, DT Port & Pin, SW Port & Pin,
