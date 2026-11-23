@@ -49,6 +49,9 @@
 #include "xmc_ccu8.h"
 #include <stdio.h>
 
+#include "readwav.h"
+#include "sd_card.h"
+#include "ff.h"
 
 #define XMC4700_SPEED_HZ 144000000
 #define SIGNAL_FREQUENCY 40000
@@ -63,17 +66,20 @@
 
 #define NUM_SPEAKERS 1 // Number of potentional elements in the array
 
-int _write(int file, char *ptr, int len)
-{
-   (void)file;
-   for (int i = 0; i < len; i++){
-       if (ptr[i] == '\n'){
-           XMC_UART_CH_Transmit(CYBSP_DEBUG_UART_HW, '\r');
-       }
-       XMC_UART_CH_Transmit(CYBSP_DEBUG_UART_HW, ptr[i]);
-   }
-   return len;
-}
+
+#define WAV_HEADER_OFFSET 44
+
+// int _write(int file, char *ptr, int len)
+// {
+//    (void)file;
+//    for (int i = 0; i < len; i++){
+//        if (ptr[i] == '\n'){
+//            XMC_UART_CH_Transmit(CYBSP_DEBUG_UART_HW, '\r');
+//        }
+//        XMC_UART_CH_Transmit(CYBSP_DEBUG_UART_HW, ptr[i]);
+//    }
+//    return len;
+// }
 
 
 
@@ -90,12 +96,13 @@ int _write(int file, char *ptr, int len)
 // Source audio values are signed integers
 alignas(4) int16_t source_buffer[2][NUM_SAMPLES];
 uint32_t* source;
+char * filename;
 uint32_t source_size = 0;
 uint32_t source_index = 0;
 
 // This will have the processed compare register values that will be written to timers by DMA channel
 // The compare register values are unsigned integers (after converting the signed source audio values)
-alignas(4) uint32_t audio_buffer[2][NUM_SAMPLES];
+alignas(4) uint32_t audio_buffer_0[2][NUM_SAMPLES];
 uint32_t shadow_transfer_enable = CCU4_GCSS_S0SE_Msk;
 
 volatile uint32_t buffer_to_load = 0;
@@ -110,7 +117,7 @@ __attribute__((aligned(32))) XMC_DMA_LLI_t dma_ll_ccu4[2] =
 {
   {
     .block_size = NUM_SAMPLES,                                            /* Transfer Block size */
-    .src_addr = (uint32_t)&audio_buffer[0][0],                            /* Source address */
+    .src_addr = (uint32_t)&audio_buffer_0[0][0],                            /* Source address */
     .dst_addr = (uint32_t)&CCU40_CC40->CRS,                                /* Destination address */
     .llp = &dma_ll_ccu4[1],                                                   /* Linked list pointer of type XMC_DMA_LLI_t */
     .src_transfer_width = XMC_DMA_CH_TRANSFER_WIDTH_32,                  /* Source transfer width */
@@ -126,7 +133,7 @@ __attribute__((aligned(32))) XMC_DMA_LLI_t dma_ll_ccu4[2] =
   },
   {
     .block_size = NUM_SAMPLES,                                            /* Transfer Block size */
-    .src_addr = (uint32_t)&audio_buffer[1][0],                            /* Source address */
+    .src_addr = (uint32_t)&audio_buffer_0[1][0],                            /* Source address */
     .dst_addr = (uint32_t)&CCU40_CC40->CRS,                                /* Destination address */
     .llp = &dma_ll_ccu4[0],                                                   /* Linked list pointer of type XMC_DMA_LLI_t */
     .src_transfer_width = XMC_DMA_CH_TRANSFER_WIDTH_32,                  /* Source transfer width */
@@ -166,8 +173,8 @@ uint32_t* adc_source = (uint32_t*) &ADC_GROUP->RES[ADC_RES_REG];
 // }
 
 
-void reset_audio_buffer(uint32_t buffer_index){
-    for (int i = 0; i < NUM_SAMPLES; i++) audio_buffer[buffer_index][i] = (CENTER_ALIGNED_TIMER_PERIOD / 2); // 50% duty cycle
+void reset_audio_buffer_0(uint32_t buffer_index){
+    for (int i = 0; i < NUM_SAMPLES; i++) audio_buffer_0[buffer_index][i] = (CENTER_ALIGNED_TIMER_PERIOD / 2); // 50% duty cycle
 }
 
 inline uint16_t signed_pcm_to_compare_val(int16_t pcm_val){ // This is a fast way to do the conversion
@@ -181,6 +188,28 @@ inline uint16_t signed_pcm_to_compare_val(int16_t pcm_val){ // This is a fast wa
 
 }
 
+inline uint16_t signed_pcm_to_compare_val_edge(int16_t pcm_val){ // This is a fast way to do the conversion
+    
+    // Converts the signed integer into unsigned (while still preserving its relative value),
+    // then multiplies by timer period (so that we have a value that is a mutiple of the timer period),
+    // then that value is divided by 2^16 (65536)
+    uint32_t result = (uint32_t) (((pcm_val + 32768U) * EDGE_ALIGNED_TIMER_PERIOD) >> 16);
+
+    return EDGE_ALIGNED_TIMER_PERIOD - result;
+
+}
+
+inline uint16_t unsigned_8_pcm_to_compare_val_edge(uint8_t pcm_val){ // This is a fast way to do the conversion
+    
+    // Converts the signed integer into unsigned (while still preserving its relative value),
+    // then multiplies by timer period (so that we have a value that is a mutiple of the timer period),
+    // then that value is divided by 2^16 (65536)
+    uint32_t val = (pcm_val << 8);
+    uint32_t result = (uint32_t) ((val * EDGE_ALIGNED_TIMER_PERIOD) >> 16);
+
+    return EDGE_ALIGNED_TIMER_PERIOD - result;
+
+}
 
 #define VAREF 3300U // in mV
 #define VOLTAGE_BIAS ((4095U - 1U) / VAREF) * 1425U // in mV
@@ -206,7 +235,7 @@ uint16_t voltage_to_compare_val_edge_aligned(int16_t voltage_val){ // This is a 
 
 }
 
-
+volatile float volume = 1.0;
 
 void fill_buffer(uint32_t buffer_index){
 
@@ -218,18 +247,20 @@ void fill_buffer(uint32_t buffer_index){
             int16_t val = source_buffer[buffer_index][i];
             // val = ((val & 0xff00) >> 8) | ((val & 0x00ff) << 8);
 
-            val = 1.0f * val; // This is just to adjust the volume if the audio is too quiet
+            val = volume * val; // This is just to adjust the volume if the audio is too quiet
            
             if (sampling) {
-                // audio_buffer[buffer_index][i] = voltage_to_compare_val(val);
-                audio_buffer[buffer_index][i] = voltage_to_compare_val_edge_aligned(val);
+                // audio_buffer_0[buffer_index][i] = voltage_to_compare_val(val);
+                audio_buffer_0[buffer_index][i] = voltage_to_compare_val_edge_aligned(val);
             }
             else {
-                audio_buffer[buffer_index][i] = signed_pcm_to_compare_val(val);
+                // audio_buffer_0[buffer_index][i] = signed_pcm_to_compare_val(val);
+                audio_buffer_0[buffer_index][i] = signed_pcm_to_compare_val_edge(val);
+                // audio_buffer_0[buffer_index][i] = unsigned_8_pcm_to_compare_val_edge(val);
                 source_index++;
             }
         }
-        else audio_buffer[buffer_index][i] = (CENTER_ALIGNED_TIMER_PERIOD / 2); // This results in compare value of 900 (50% duty cycle)
+        else audio_buffer_0[buffer_index][i] = (EDGE_ALIGNED_TIMER_PERIOD / 2); // This results in compare value of 900 (50% duty cycle)
 
     }
 
@@ -266,8 +297,10 @@ void dma_load_source_audio(XMC_DMA_t* dma_group, uint8_t dma_channel, uint32_t s
 
 }
 
-volatile bool fill_next_buffer = false; //
+volatile bool fill_next_buffer = false;
 
+volatile bool buffer_filled = true;
+volatile bool audio_buffer_filled = true;
 
 // This is the main synchronization interupt tied to DMA Channel 0
 // Only DMA channel 0 is configured as using multi-block linked list, so this interrupt tells us when one part of the buffer is filled
@@ -280,27 +313,35 @@ void gpdma_0_ch_0_EventHandler(XMC_DMA_CH_EVENT_t event){
 
         // while (XMC_DMA_CH_IsEnabled(DMA_CH2_HW, SOURCE_DMA_CH2) || XMC_DMA_CH_IsEnabled(DMA_CH3_HW, SOURCE_DMA_CH3)){} // Just to make sure DMA is finished
         
-        // Set the DMA to get the next chunk of audio values from source
-        if (sampling) {
+        // Set the DMA to get the next chunk of audio values from source (Not being used)
+        /* if (sampling) {
             while (XMC_DMA_CH_IsEnabled(DMA_CH3_HW, SOURCE_DMA_CH3)){}
             dma_load_source_audio(DMA_CH3_HW, SOURCE_DMA_CH3, (uint32_t) adc_source, (uint32_t) source_buffer[buffer_to_load]);
         }
-        else dma_load_source_audio(DMA_CH2_HW, SOURCE_DMA_CH2, (uint32_t)(piano_note_bin + ((source_index + 256) * 2)), (uint32_t) source_buffer[buffer_to_load]);
-        // Need to fix this else statement since its based on older code
+        else */
+        
+        if (!audio_buffer_filled || !buffer_filled){
+            fill_buffer(buffer_to_load); // This is for error checking
+        }
+
+        // Need to fix this else statement since its based on older code (FIXED, this is the old code)
+        //dma_load_source_audio(DMA_CH2_HW, SOURCE_DMA_CH2, (uint32_t)(piano_note_bin + ((source_index + 256) * 2)), (uint32_t) source_buffer[buffer_to_load]);
 
         // This triggers the PendSV interrupt where the audio will get processed (it is the lowest priority interrupt)
         SCB->ICSR |= SCB_ICSR_PENDSVSET_Msk; // I don't really know what this means (I just found this online)
         
-
+        audio_buffer_filled = false;
+        buffer_filled = false;
 
     }
     else if (loop) {
     
-        source_index = 0;
+        source_index = 44;
 
         // dma_load_source_audio(DMA_CH2_HW, SOURCE_DMA_CH2, (uint32_t)(piano_note_bin), (uint32_t) source_buffer[buffer_to_load]);
 
         fill_buffer(buffer_to_load);
+
 
     }
     else { // Stop Output
@@ -312,7 +353,7 @@ void gpdma_0_ch_0_EventHandler(XMC_DMA_CH_EVENT_t event){
         // XMC_DMA_CH_Disable(DMA_CH0_HW, CCU4_DMA_CH0);            // Enable the DMA for timer compare registers
         // XMC_DMA_CH_Disable(DMA_CH1_HW, SHADOW_TRANSFER_DMA_CH1); // Enable the DMA for the shadow transfer enable
         // XMC_CCU4_SLICE_StopTimer(CCU40_CC40); // Stop the PWM
-        reset_audio_buffer(buffer_to_load);
+        reset_audio_buffer_0(buffer_to_load);
         buffer_to_load = !buffer_to_load;
 
 
@@ -324,7 +365,7 @@ void gpdma_0_ch_0_EventHandler(XMC_DMA_CH_EVENT_t event){
 }
 
 // DMA re-trigger handler for PWM_OUTPUT_4
-uint32_t* source_buffer_ccu4_4 = (uint32_t*) &audio_buffer[0];
+uint32_t* source_buffer_ccu4_4 = (uint32_t*) &audio_buffer_0[0];
 uint32_t* ccu4_4_dest = (uint32_t*)&(CCU42_CC40->CRS);
 
 void gpdma_0_ch_1_EventHandler(XMC_DMA_CH_EVENT_t event) {
@@ -336,7 +377,7 @@ void gpdma_0_ch_1_EventHandler(XMC_DMA_CH_EVENT_t event) {
 }
 
 // DMA re-trigger handler for PWM_OUTPUT_1
-uint32_t* source_buffer_ccu4_1 = (uint32_t*) &audio_buffer[0];
+uint32_t* source_buffer_ccu4_1 = (uint32_t*) &audio_buffer_0[0];
 uint32_t* ccu4_1_dest = (uint32_t*)&(CCU40_CC42->CRS);
 
 void gpdma_0_ch_2_EventHandler(XMC_DMA_CH_EVENT_t event) {
@@ -349,7 +390,7 @@ void gpdma_0_ch_2_EventHandler(XMC_DMA_CH_EVENT_t event) {
 }
 
 // DMA re-trigger handler for PWM_OUTPUT_6
-uint32_t* source_buffer_ccu4_6 = (uint32_t*) &audio_buffer[0];
+uint32_t* source_buffer_ccu4_6 = (uint32_t*) &audio_buffer_0[0];
 uint32_t* ccu4_6_dest = (uint32_t*)&(CCU43_CC40->CRS);
 
 void gpdma_0_ch_5_EventHandler(XMC_DMA_CH_EVENT_t event) {
@@ -362,7 +403,7 @@ void gpdma_0_ch_5_EventHandler(XMC_DMA_CH_EVENT_t event) {
 }
 
 // DMA re-trigger handler for PWM_OUTPUT_3
-uint32_t* source_buffer_ccu4_3 = (uint32_t*) &audio_buffer[0];
+uint32_t* source_buffer_ccu4_3 = (uint32_t*) &audio_buffer_0[0];
 uint32_t* ccu4_3_dest = (uint32_t*)&(CCU41_CC42->CRS);
 
 void gpdma_0_ch_6_EventHandler(XMC_DMA_CH_EVENT_t event) {
@@ -375,7 +416,7 @@ void gpdma_0_ch_6_EventHandler(XMC_DMA_CH_EVENT_t event) {
 }
 
 // DMA re-trigger handler for PWM_OUTPUT_7
-uint32_t* source_buffer_ccu4_7 = (uint32_t*) &audio_buffer[0];
+uint32_t* source_buffer_ccu4_7 = (uint32_t*) &audio_buffer_0[0];
 uint32_t* ccu4_7_dest = (uint32_t*)&(CCU43_CC42->CRS);
 
 void gpdma_0_ch_7_EventHandler(XMC_DMA_CH_EVENT_t event) {
@@ -389,7 +430,7 @@ void gpdma_0_ch_7_EventHandler(XMC_DMA_CH_EVENT_t event) {
 }
 
 // DMA re-trigger handler for PWM_OUTPUT_5
-uint32_t* source_buffer_ccu4_5 = (uint32_t*) &audio_buffer[0];
+uint32_t* source_buffer_ccu4_5 = (uint32_t*) &audio_buffer_0[0];
 uint32_t* ccu4_5_dest = (uint32_t*)&(CCU42_CC42->CRS);
 
 void gpdma_1_ch_1_EventHandler(XMC_DMA_CH_EVENT_t event) {
@@ -403,7 +444,7 @@ void gpdma_1_ch_1_EventHandler(XMC_DMA_CH_EVENT_t event) {
 
 
 // DMA re-trigger handler for PWM_OUTPUT_2
-uint32_t* source_buffer_ccu4_2 = (uint32_t*) &audio_buffer[0];
+uint32_t* source_buffer_ccu4_2 = (uint32_t*) &audio_buffer_0[0];
 uint32_t* ccu4_2_dest = (uint32_t*)&(CCU41_CC40->CRS);
 
 void gpdma_0_ch_4_EventHandler(XMC_DMA_CH_EVENT_t event) {
@@ -441,8 +482,18 @@ volatile uint32_t* compare_val_0 = (uint32_t *)&(CCU40_CC40->CR);
 volatile uint32_t* compare_val_1 = (uint32_t *)&(CCU41_CC40->CR);
 
 void PendSV_Handler(void) {
+    // fill_buffer(buffer_to_load);
+    // // buffer_to_load = !buffer_to_load;
+    // read_wav_segment (filename, (source_index) + WAV_HEADER_OFFSET, 256, source_buffer[buffer_to_load]);
+    read_wav_segment (filename, (source_index * 2) + WAV_HEADER_OFFSET, 256 * 2, source_buffer[buffer_to_load]);
+    buffer_filled = true;
+    buffer_to_load = !buffer_to_load;
     fill_buffer(buffer_to_load);
+    audio_buffer_filled = true;
+
 }
+
+static FATFS fs;
 
 int main(void)
  {
@@ -455,13 +506,27 @@ int main(void)
         CY_ASSERT(0);
     }
 
-    loop = true;
-    sampling = true;
-    buffer_to_load = 0;
-    source = adc_source;
+    // Mount filesystem
+    sd_card_init();
+    f_mount(&fs, "", 1);
+    
 
-    reset_audio_buffer(0);
-    reset_audio_buffer(1);
+    // filename = "vaudeville-villain.wav";
+    // filename = "vaudeville-villain-8.wav";
+    filename = "sun-ship.wav";
+    source_index = 0;
+    source_size = wav_get_size(filename);
+
+    open_wav(filename, WAV_HEADER_OFFSET);
+
+    loop = true;
+    sampling = false;
+    buffer_to_load = 0;
+    // source = adc_source;
+
+    reset_audio_buffer_0(0);
+    reset_audio_buffer_0(1);
+
 
     
     // Set PendSV to the lowest priority so it doesn't block hardware ISRs
@@ -528,11 +593,22 @@ int main(void)
     // gcss_refresh_dma_init();
 
     // XMC_CCU4_SLICE_StartTimer(CCU40_CC41); // Start the PWM_MASTER_CLOCK (which triggers the PWM_OUTPUT which is configured as one shot)
-    dma_load_source_audio(ADC_DMA_CH2_HW, ADC_DMA_CH2, (uint32_t) source, (uint32_t)source_buffer[buffer_to_load]); // NEED TO FIX THIS LINE, PRETTY SURE ITS THE WRONG DMA group
     
+    // read_wav_segment(filename, source_index + WAV_HEADER_OFFSET, 256 * 2, source_buffer[buffer_to_load]);
+    // buffer_to_load = !buffer_to_load;
+    //dma_load_source_audio(ADC_DMA_CH2_HW, ADC_DMA_CH2, (uint32_t) source, (uint32_t)source_buffer[buffer_to_load]); // NEED TO FIX THIS LINE, PRETTY SURE ITS THE WRONG DMA group (OLD)
+    
+    // read_wav_segment(filename, source_index + WAV_HEADER_OFFSET, 256, source_buffer[buffer_to_load]);
+    read_wav_segment (filename, (source_index * 2) + WAV_HEADER_OFFSET, 256 * 2, source_buffer[buffer_to_load]);
+    buffer_to_load = !buffer_to_load;
+    buffer_filled = true;
+
     NVIC_SetPriority(CCU80_0_IRQn, 0U);
     NVIC_EnableIRQ(CCU80_0_IRQn); // one channel for now
     XMC_CCU8_SLICE_StartTimer(CCU80_CC80);
+
+    // read_wav_segment(filename, source_index + WAV_HEADER_OFFSET, 256 * 2, source_buffer[buffer_to_load]);
+
     // XMC_CCU8_SLICE_SetInterruptNode(CCU80_CC80, XMC_CCU8_SLICE_IRQ_ID_PERIOD_MATCH, XMC_CCU8_SLICE_SR_ID_0);
     // XMC_CCU8_SLICE_EnableEvent(CCU80_CC80, XMC_CCU8_SLICE_IRQ_ID_PERIOD_MATCH);
     // XMC_CCU8_SLICE_StartTimer(CCU80_CC80);
@@ -546,12 +622,12 @@ int main(void)
 
     while (true){
 
-        // This just prints out compare values so we can see it on the serial monitor (this is because using the debugger messes up how the code runs)
-        XMC_Delay(1000);
-        uint32_t val0 = *compare_val_0;
-        uint32_t val1 = *compare_val_1;
+        // // This just prints out compare values so we can see it on the serial monitor (this is because using the debugger messes up how the code runs)
+        // XMC_Delay(1000);
+        // uint32_t val0 = *compare_val_0;
+        // uint32_t val1 = *compare_val_1;
 
-        printf("%ld, %ld\n", val0, val1);
+        // printf("%ld, %ld\n", val0, val1);
 
     }
     //////////////////////////////
@@ -560,13 +636,15 @@ int main(void)
 
     buffer_to_load = 0;
 
-    source_index = 0;
-    source_size = piano_note_bin_len / 2; // piano_note_bin_len size in bytes / 2 bytes per 16 bit val
+    filename = "get-got-.wav";
+    source_index = 44;
+    source_size = wav_get_size(filename); // piano_note_bin_len size in bytes / 2 bytes per 16 bit val
     
-    reset_audio_buffer(0);
-    reset_audio_buffer(1);
+    reset_audio_buffer_0(0);
+    reset_audio_buffer_0(1);
 
-    dma_load_source_audio(DMA_CH2_HW, SOURCE_DMA_CH2, (uint32_t) piano_note_bin, (uint32_t)source_buffer[buffer_to_load]); // DMA fills source_buffer[0]
+    read_wav_segment(filename, source_index, 256, source_buffer[buffer_to_load]);
+    // dma_load_source_audio(DMA_CH2_HW, SOURCE_DMA_CH2, (uint32_t) piano_note_bin, (uint32_t)source_buffer[buffer_to_load]); // DMA fills source_buffer[0]
 
     // Enable the DMA channel to initiate transfer + Start the timer for the PWM
     NVIC_EnableIRQ(GPDMA0_0_IRQn); // one channel for now
@@ -605,13 +683,12 @@ void fill_buffer_with_sine(){
     for (uint32_t k = 0U; k < BLOCK_SIZE; k++) {
         float s = sinf(two_pi * ((float)k/2.0f)/( (float)BLOCK_SIZE));
         uint32_t duty = duty_to_cr(0.50f + (0.40f * s));
-        audio_buffer[0][k] = duty / 2;
+        audio_buffer_0[0][k] = duty / 2;
     }
 
     for (uint32_t k = 0U; k < BLOCK_SIZE; k++) {
         float s = sinf(two_pi * ((float)(k + BLOCK_SIZE)/2.0f)/( (float)BLOCK_SIZE));
         uint32_t duty = duty_to_cr(0.50f + (0.40f * s));
-        audio_buffer[1][k] = (duty / 2);
+        audio_buffer_0[1][k] = (duty / 2);
     }
 }
-
