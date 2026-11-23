@@ -1,4 +1,5 @@
 #include "lcd_screen.h"
+#include "encoder.h"
 
 static volatile uint32_t milliseconds = 0;
 
@@ -67,8 +68,10 @@ void lcd_set_cursor(uint8_t row, uint8_t column)
     }
 }
 
+/* Used to demo the LCD screen working with the encoder. */
 int main(void)
 {
+    // === GUI Config START ===
     cy_rslt_t result = cybsp_init();
 
     if (result != CY_RSLT_SUCCESS)
@@ -76,6 +79,10 @@ int main(void)
         CY_ASSERT(0);
         while (1) {}
     }
+    // === GUI Config END ===
+
+    Encoder encoder;
+    encoder_init(&encoder, 3, 8, 3, 7, 3, 9, 3, 0, 0);
 
     XMC_UART_CH_Start(CYBSP_DEBUG_UART_HW);
 
@@ -94,18 +101,28 @@ int main(void)
     lcd_command(0x51);                  // Clear screen
 
     lcd_set_cursor(0, 0);
-    lcd_print("Hello from XMC4700");
+    lcd_print(">Song");
 
-    lcd_set_cursor(1, 0);
-    lcd_print("Audio system ready");
+    for(int i = 1; i < 4; i++) {
+        lcd_set_cursor(i, 1);
+        lcd_print("Song");
+    }
 
-    while (1)
-    {
-        XMC_GPIO_ToggleOutput(
-            CYBSP_USER_LED_PORT,
-            CYBSP_USER_LED_PIN
-        );
+    int displayed_pos = encoder.pos;
 
-        // delay_ms(1000);
+    while (1) {
+    
+    encoder_read(&encoder);
+    if (encoder.pos != displayed_pos) {
+        lcd_set_cursor(displayed_pos, 0);
+        lcd_print(" ");
+
+        lcd_set_cursor(encoder.pos, 0);
+        lcd_print(">");
+
+        displayed_pos = encoder.pos;
+    }
+
+        // delay_ms(100); // Debouce Time
     }
 }

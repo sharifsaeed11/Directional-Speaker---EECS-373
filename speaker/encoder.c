@@ -43,6 +43,7 @@ void encoder_init(Encoder * encoder, const uint8_t clk_port,
     encoder->MAX_POS  = MAX_POS;
     encoder->MIN_POS  = MIN_POS;
     encoder->pos      = INIT_POS;
+    encoder->transition_count = 0;
 
     // Read the starting state so the first read is not seen as a jump.
     uint8_t clk = XMC_GPIO_GetInput(int2port(clk_port), clk_pin);
@@ -53,33 +54,58 @@ void encoder_init(Encoder * encoder, const uint8_t clk_port,
 }
 
 int encoder_read(Encoder * encoder) {
-    uint8_t clk = XMC_GPIO_GetInput(int2port(encoder->clk_port), encoder->clk_pin);
-    uint8_t dt  = XMC_GPIO_GetInput(int2port(encoder->dt_port),  encoder->dt_pin);
+    // Used AI to smooth out the counting logic.
+    // Initial implementation was 'finicky'.
 
-    encoder->prev_state = encoder->state;
-    encoder->state      = (clk << 1) | dt;
+    // Read the current CLK and DT pin states.
+    uint8_t clk = XMC_GPIO_GetInput(
+        int2port(encoder->clk_port), encoder->clk_pin);
 
-    switch (encoder->prev_state) {
-        case 0b11:
-            if (encoder->state == 0b01) encoder->pos++;   // clockwise
-            if (encoder->state == 0b10) encoder->pos--;   // counterclockwise
-            break;
-        case 0b01:
-            if (encoder->state == 0b00) encoder->pos++;   // clockwise
-            if (encoder->state == 0b11) encoder->pos--;   // counterclockwise
-            break;
-        case 0b00:
-            if (encoder->state == 0b10) encoder->pos++;   // clockwise
-            if (encoder->state == 0b01) encoder->pos--;   // counterclockwise
-            break;
-        case 0b10:
-            if (encoder->state == 0b11) encoder->pos++;   // clockwise
-            if (encoder->state == 0b00) encoder->pos--;   // counterclockwise
-            break;
+    uint8_t dt = XMC_GPIO_GetInput(
+        int2port(encoder->dt_port), encoder->dt_pin);
+
+    uint8_t new_state = (clk << 1) | dt;
+
+    // Determine the direction of movement using the previous
+    // and current states of the encoder.
+    static const int8_t transition_table[16] = {
+         0, -1,  1,  0,
+         1,  0,  0, -1,
+        -1,  0,  0,  1,
+         0,  1, -1,  0
+    };
+
+    uint8_t index = (encoder->state << 2) | new_state;
+    int8_t transition = transition_table[index];
+
+    // Add valid movements to the counter. Opposite movements
+    // cancel each other out instead of changing the position.
+    if (transition != 0) {
+        encoder->transition_count += transition;
     }
 
-    if (encoder->pos > encoder->MAX_POS) encoder->pos = encoder->MAX_POS;
-    if (encoder->pos < encoder->MIN_POS) encoder->pos = encoder->MIN_POS;
+    // Save the current state for the next encoder reading.
+    encoder->state = new_state;
+
+    // Update the position after four transitions in the same direction.
+    if (encoder->transition_count >= 4) {
+        encoder->pos++;
+        encoder->transition_count = 0;
+    } else if (encoder->transition_count <= -4) {
+        encoder->pos--;
+        encoder->transition_count = 0;
+    }
+
+    // Keep the position within the configured minimum and maximum.
+    if (encoder->pos > encoder->MAX_POS) {
+        encoder->pos = encoder->MAX_POS;
+        encoder->transition_count = 0;
+    }
+
+    if (encoder->pos < encoder->MIN_POS) {
+        encoder->pos = encoder->MIN_POS;
+        encoder->transition_count = 0;
+    }
 
     return encoder->pos;
 }
