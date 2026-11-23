@@ -1,4 +1,4 @@
-Created with ChatGPT by Andrew (11/23)
+Created with ChatGPT by Andrew (11/22)
 
 # Configuring a UART TX Pin in ModusToolbox
 
